@@ -8,10 +8,12 @@ local Promise = require(script.Promise)
 local tracebacksEnabled = false
 local captureAddTracebacks = false
 local leakWarningsEnabled = true
+local profilingEnabled = false
 local activeScopeRegistry: any = setmetatable({}, {
 	__mode = "k",
 })
 local activeScopes: { [any]: boolean } = activeScopeRegistry
+local DEFAULT_BATCH_SIZE = 50
 
 export type ConnectionLike = {
 	Connected: boolean?,
@@ -27,6 +29,10 @@ export type PromiseLike = {
 	getStatus: (self: any) -> string,
 	["finally"]: (self: any, callback: (...any) -> ...any) -> any,
 	cancel: (self: any) -> (),
+}
+
+export type Cancelable = {
+	Cancel: (self: any) -> (),
 }
 
 export type Constructable<T> = { new: (...any) -> T } | ((...any) -> T)
@@ -50,9 +56,7 @@ export type Trackable =
 | {
 	disconnect: (self: any) -> (),
 }
-| {
-	Cancel: (self: any) -> (),
-}
+| Cancelable
 | {
 	cancel: (self: any) -> (),
 }
@@ -91,6 +95,9 @@ export type ScopeDebugSummary = {
 	destroyed: boolean,
 	cleaning: boolean,
 	destroyReason: string,
+	cleanupCount: number,
+	lastCleanupDuration: number,
+	peakCleanupDuration: number,
 	lastCleanupError: string,
 	lastFailedObjectType: string,
 	lastFailedTag: string,
@@ -109,10 +116,26 @@ export type GarbageMan = {
 	Construct: <T>(self: GarbageMan, class: Constructable<T>, ...any) -> T,
 	Connect: (self: GarbageMan, signal: SignalLike | RBXScriptSignal, fn: (...any) -> ...any) -> ConnectionLike,
 	Once: (self: GarbageMan, signal: SignalLike | RBXScriptSignal, fn: (...any) -> ...any) -> ConnectionLike,
+	DestroyOnSignal: (self: GarbageMan, signal: SignalLike | RBXScriptSignal, reason: any?) -> ConnectionLike,
+	ReplaceConnection: (
+		self: GarbageMan,
+		tag: any,
+		signal: SignalLike | RBXScriptSignal,
+		fn: (...any) -> ...any
+	) -> ConnectionLike,
 	Render: (self: GarbageMan, name: string, priority: number, fn: (dt: number) -> ()) -> (),
 	AddPromise: <T>(self: GarbageMan, promise: T & PromiseLike) -> T,
 	Add: <T>(self: GarbageMan, object: T & Trackable, cleanupMethod: string?, tag: any?) -> T,
+	AddTemporary: <T>(
+		self: GarbageMan,
+		object: T & Trackable,
+		seconds: number,
+		cleanupMethod: string?,
+		tag: any?
+	) -> T,
+	AddMany: (self: GarbageMan, ...any) -> GarbageMan,
 	Replace: <T>(self: GarbageMan, tag: any, object: T & Trackable, cleanupMethod: string?) -> T,
+	ReplaceTween: <T>(self: GarbageMan, tag: any, tween: T & Cancelable) -> T,
 	Get: (self: GarbageMan, tag: any) -> any?,
 	Contains: (self: GarbageMan, object: any) -> boolean,
 	ContainsTag: (self: GarbageMan, tag: any) -> boolean,
@@ -131,9 +154,12 @@ export type GarbageMan = {
 	IsCleaning: (self: GarbageMan) -> boolean,
 	IsDestroyed: (self: GarbageMan) -> boolean,
 	WarnIfNotDestroyedAfter: (self: GarbageMan, seconds: number, message: string?) -> LifecycleDisconnect,
+	CleanAfter: (self: GarbageMan, seconds: number) -> LifecycleDisconnect,
+	DestroyAfter: (self: GarbageMan, seconds: number, reason: any?) -> LifecycleDisconnect,
 	Clean: (self: GarbageMan) -> (),
 	TryClean: (self: GarbageMan) -> (boolean, any),
 	CleanDeferred: (self: GarbageMan) -> (),
+	CleanBatched: (self: GarbageMan, batchSize: number?) -> (),
 	WrapClean: (self: GarbageMan) -> () -> (),
 	BindTo: (self: GarbageMan, instance: Instance) -> RBXScriptConnection,
 	BindToAncestry: (self: GarbageMan, instance: Instance) -> RBXScriptConnection,
@@ -142,6 +168,7 @@ export type GarbageMan = {
 	Destroy: (self: GarbageMan, reason: any?) -> (),
 	TryDestroy: (self: GarbageMan, reason: any?) -> (boolean, any),
 	DestroyDeferred: (self: GarbageMan, reason: any?) -> (),
+	DestroyBatched: (self: GarbageMan, reason: any?, batchSize: number?) -> (),
 
 	_name: string,
 	_createdAt: number,
@@ -155,6 +182,9 @@ export type GarbageMan = {
 	_destroyReason: any?,
 	_lastCleanupError: any?,
 	_lastFailedEntry: DebugEntry?,
+	_cleanupCount: number,
+	_lastCleanupDuration: number,
+	_peakCleanupDuration: number,
 	_cleanDeferredQueued: boolean,
 	_destroyingCallbacks: { LifecycleCallback },
 	_destroyedCallbacks: { LifecycleCallback },
@@ -168,6 +198,7 @@ export type Config = {
 	tracebacks: boolean?,
 	captureAddTracebacks: boolean?,
 	leakWarnings: boolean?,
+	profiling: boolean?,
 	errorHandler: (ErrorHandler | false)?,
 }
 
@@ -188,6 +219,8 @@ type GarbageManInternal = GarbageMan & {
 	_sweepObject: (self: GarbageManInternal, object: any, shouldRun: boolean) -> boolean,
 	_sweepAt: (self: GarbageManInternal, index: number, shouldRun: boolean) -> boolean,
 }
+
+type CleanupFinishedCallback = (finished: boolean, message: any) -> ()
 
 local GarbageManClass = {}
 GarbageManClass.__index = GarbageManClass
@@ -313,6 +346,43 @@ local function storeCleanupFailure(self: GarbageManInternal, entry: Entry, messa
 	self._lastFailedEntry = createDebugEntry(entry)
 end
 
+local function beginCleanupProfile(): number
+	if not profilingEnabled then
+		return 0
+	end
+
+	local startedAt = os.clock()
+	return startedAt
+end
+
+local function finishCleanupProfile(self: GarbageManInternal, startedAt: number)
+	self._cleanupCount += 1
+
+	if not profilingEnabled then
+		return
+	end
+
+	local duration = os.clock() - startedAt
+
+	self._lastCleanupDuration = duration
+
+	if duration > self._peakCleanupDuration then
+		self._peakCleanupDuration = duration
+	end
+end
+
+local function detachEntries(self: GarbageManInternal): { Entry }
+	local entries = self._entries
+
+	self._entries = {}
+	self._indices = {}
+	self._tags = {}
+	self._dependents = {}
+	self._parents = {}
+
+	return entries
+end
+
 local function sweepEntries(entries: { Entry }): (boolean, any, Entry?)
 	local failed = false
 	local firstError: any = nil
@@ -429,6 +499,90 @@ local function addLifecycleCallback(
 	return disconnect
 end
 
+local function readBatchSize(batchSize: number?): number
+	if batchSize == nil then
+		return DEFAULT_BATCH_SIZE
+	end
+
+	if typeof(batchSize) ~= "number" or batchSize < 1 or batchSize ~= batchSize or batchSize == math.huge then
+		error("batchSize must be a positive finite number", 3)
+	end
+
+	local normalized = math.floor(batchSize)
+	return normalized
+end
+
+local function readDelaySeconds(seconds: number): number
+	if typeof(seconds) ~= "number" or seconds < 0 or seconds ~= seconds or seconds == math.huge then
+		error("seconds must be a non-negative finite number", 3)
+	end
+
+	return seconds
+end
+
+local function runBatchedCleanup(
+	self: GarbageManInternal,
+	entries: { Entry },
+	batchSize: number,
+	onFinished: CleanupFinishedCallback
+)
+	local startedAt = beginCleanupProfile()
+	local index = #entries
+	local failed = false
+	local firstError: any = nil
+	local firstFailedEntry: Entry? = nil
+
+	local function complete()
+		self._sweeping = false
+		finishCleanupProfile(self, startedAt)
+
+		if failed then
+			if firstFailedEntry ~= nil then
+				storeCleanupFailure(self, firstFailedEntry, firstError)
+			else
+				self._lastCleanupError = firstError
+			end
+
+			onFinished(false, firstError)
+			return
+		end
+
+		onFinished(true, nil)
+	end
+
+	local function runBatch()
+		local processed = 0
+
+		while index >= 1 and processed < batchSize do
+			local entry = entries[index]
+			index -= 1
+			processed += 1
+
+			if entry ~= nil then
+				local ok: boolean
+				local message: any
+
+				ok, message = runCleanup(entry)
+
+				if not ok and not failed then
+					failed = true
+					firstError = message
+					firstFailedEntry = entry
+				end
+			end
+		end
+
+		if index >= 1 then
+			task.defer(runBatch)
+			return
+		end
+
+		complete()
+	end
+
+	task.defer(runBatch)
+end
+
 local function sweepAllInternal(self: GarbageManInternal): (boolean, any)
 	if self._sweeping then
 		return true, nil
@@ -438,12 +592,8 @@ local function sweepAllInternal(self: GarbageManInternal): (boolean, any)
 	self._lastCleanupError = nil
 	self._lastFailedEntry = nil
 
-	local entries = self._entries
-	self._entries = {}
-	self._indices = {}
-	self._tags = {}
-	self._dependents = {}
-	self._parents = {}
+	local startedAt = beginCleanupProfile()
+	local entries = detachEntries(self)
 
 	local function runSweep(): (boolean, any, Entry?)
 		return sweepEntries(entries)
@@ -456,6 +606,7 @@ local function sweepAllInternal(self: GarbageManInternal): (boolean, any)
 
 	ok, failed, message, failedEntry = xpcall(runSweep, formatError)
 	self._sweeping = false
+	finishCleanupProfile(self, startedAt)
 
 	if not ok then
 		self._lastCleanupError = failed
@@ -519,6 +670,9 @@ function GarbageManClass.new(name: string?): GarbageMan
 		_destroyReason = nil,
 		_lastCleanupError = nil,
 		_lastFailedEntry = nil,
+		_cleanupCount = 0,
+		_lastCleanupDuration = 0,
+		_peakCleanupDuration = 0,
 		_cleanDeferredQueued = false,
 		_destroyingCallbacks = {},
 		_destroyedCallbacks = {},
@@ -693,6 +847,54 @@ function GarbageManClass.Add<T>(
 	return added
 end
 
+function GarbageManClass.AddTemporary<T>(
+	self: GarbageManInternal,
+	object: T & Trackable,
+	seconds: number,
+	cleanupMethod: string?,
+	tag: any?
+): T
+	assertMutable(self, "AddTemporary")
+
+	local delaySeconds = readDelaySeconds(seconds)
+	local added = collect(self, object, cleanupMethod, tag)
+
+	local function removeTemporary()
+		if self._destroyed or self._sweeping then
+			return
+		end
+
+		local ok: boolean
+		local message: any
+
+		ok, message = xpcall(function()
+			self:Remove(added)
+		end, formatError)
+
+		if not ok then
+			reportAsyncError(self, message)
+		end
+	end
+
+	task.delay(delaySeconds, removeTemporary)
+
+	return added
+end
+
+function GarbageManClass.AddMany(self: GarbageManInternal, ...: any): GarbageMan
+	assertMutable(self, "AddMany")
+
+	local count = select("#", ...)
+
+	for index = 1, count do
+		local object = select(index, ...)
+		collect(self, object, nil, nil)
+	end
+
+	local scope: any = self
+	return scope
+end
+
 function GarbageManClass.Replace<T>(
 	self: GarbageManInternal,
 	tag: any,
@@ -703,6 +905,14 @@ function GarbageManClass.Replace<T>(
 	assertMutable(self, "Replace")
 
 	local replaced = collect(self, object, cleanupMethod, tag)
+	return replaced
+end
+
+function GarbageManClass.ReplaceTween<T>(self: GarbageManInternal, tag: any, tween: T & Cancelable): T
+	assert(tag ~= nil, "GarbageMan tag cannot be nil")
+	assertMutable(self, "ReplaceTween")
+
+	local replaced = collect(self, tween, "Cancel", tag)
 	return replaced
 end
 
@@ -876,9 +1086,7 @@ function GarbageManClass.WarnIfNotDestroyedAfter(
 	seconds: number,
 	message: string?
 ): LifecycleDisconnect
-	if typeof(seconds) ~= "number" or seconds < 0 then
-		error("seconds must be a non-negative number", 2)
-	end
+	local delaySeconds = readDelaySeconds(seconds)
 
 	if message ~= nil and typeof(message) ~= "string" then
 		error("message must be a string", 2)
@@ -901,7 +1109,63 @@ function GarbageManClass.WarnIfNotDestroyedAfter(
 		warn(warningMessage)
 	end
 
-	task.delay(seconds, runLeakWarning)
+	task.delay(delaySeconds, runLeakWarning)
+
+	return function()
+		cancelled = true
+	end
+end
+
+function GarbageManClass.CleanAfter(self: GarbageManInternal, seconds: number): LifecycleDisconnect
+	local delaySeconds = readDelaySeconds(seconds)
+	local cancelled = false
+
+	local function runDelayedClean()
+		if cancelled or self._destroyed then
+			return
+		end
+
+		local ok: boolean
+		local message: any
+
+		ok, message = self:TryClean()
+
+		if not ok then
+			reportAsyncError(self, message)
+		end
+	end
+
+	task.delay(delaySeconds, runDelayedClean)
+
+	return function()
+		cancelled = true
+	end
+end
+
+function GarbageManClass.DestroyAfter(
+	self: GarbageManInternal,
+	seconds: number,
+	reason: any?
+): LifecycleDisconnect
+	local delaySeconds = readDelaySeconds(seconds)
+	local cancelled = false
+
+	local function runDelayedDestroy()
+		if cancelled or self._destroyed then
+			return
+		end
+
+		local ok: boolean
+		local message: any
+
+		ok, message = self:TryDestroy(reason)
+
+		if not ok then
+			reportAsyncError(self, message)
+		end
+	end
+
+	task.delay(delaySeconds, runDelayedDestroy)
 
 	return function()
 		cancelled = true
@@ -1011,6 +1275,43 @@ function GarbageManClass.Once(
 	return collected
 end
 
+function GarbageManClass.DestroyOnSignal(
+	self: GarbageManInternal,
+	signal: SignalLike | RBXScriptSignal,
+	reason: any?
+): any
+	assertMutable(self, "DestroyOnSignal")
+
+	local function onSignal()
+		local ok: boolean
+		local message: any
+
+		ok, message = self:TryDestroy(reason)
+
+		if not ok then
+			reportAsyncError(self, message)
+		end
+	end
+
+	local connection = self:Once(signal, onSignal)
+	return connection
+end
+
+function GarbageManClass.ReplaceConnection(
+	self: GarbageManInternal,
+	tag: any,
+	signal: SignalLike | RBXScriptSignal,
+	fn: (...any) -> ...any
+): any
+	assert(tag ~= nil, "GarbageMan tag cannot be nil")
+	assertMutable(self, "ReplaceConnection")
+
+	local signalAny: any = signal
+	local connection = signalAny:Connect(fn)
+	local collected = collect(self, connection, nil, tag)
+	return collected
+end
+
 function GarbageManClass.Render(
 	self: GarbageManInternal,
 	name: string,
@@ -1107,6 +1408,10 @@ local function cleanScope(self: GarbageManInternal)
 end
 
 function GarbageManClass.Clean(self: GarbageManInternal)
+	if self._destroyed then
+		return
+	end
+
 	cleanScope(self)
 end
 
@@ -1137,6 +1442,30 @@ function GarbageManClass.CleanDeferred(self: GarbageManInternal)
 	end
 
 	task.defer(runDeferredClean)
+end
+
+function GarbageManClass.CleanBatched(self: GarbageManInternal, batchSize: number?)
+	if self._destroyed or self._sweeping then
+		return
+	end
+
+	local size = readBatchSize(batchSize)
+
+	self._sweeping = true
+	self._lastCleanupError = nil
+	self._lastFailedEntry = nil
+
+	local entries = detachEntries(self)
+
+	local function onFinished(finished: boolean, message: any)
+		if finished then
+			return
+		end
+
+		reportAsyncError(self, message)
+	end
+
+	runBatchedCleanup(self, entries, size, onFinished)
 end
 
 function GarbageManClass.WrapClean(self: GarbageManInternal): () -> ()
@@ -1230,6 +1559,54 @@ function GarbageManClass.DestroyDeferred(self: GarbageManInternal, reason: any?)
 	end
 end
 
+function GarbageManClass.DestroyBatched(self: GarbageManInternal, reason: any?, batchSize: number?)
+	if self._destroyed then
+		return
+	end
+
+	if self._sweeping then
+		error("cannot call GarbageMan:DestroyBatched() while cleaning", 2)
+	end
+
+	local size = readBatchSize(batchSize)
+
+	self._destroyed = true
+	self._destroyReason = reason
+
+	local destroyingFailed: boolean
+	local destroyingMessage: any
+
+	destroyingFailed, destroyingMessage = runLifecycleCallbacks(self._destroyingCallbacks, reason)
+
+	self._sweeping = true
+	self._lastCleanupError = nil
+	self._lastFailedEntry = nil
+
+	local entries = detachEntries(self)
+
+	local function onFinished(finished: boolean, message: any)
+		local destroyedFailed: boolean
+		local destroyedMessage: any
+
+		destroyedFailed, destroyedMessage = runLifecycleCallbacks(self._destroyedCallbacks, self._destroyReason)
+		unregisterScope(self)
+
+		if not finished then
+			reportAsyncError(self, message)
+		end
+
+		if destroyedFailed then
+			reportAsyncError(self, destroyedMessage)
+		end
+	end
+
+	runBatchedCleanup(self, entries, size, onFinished)
+
+	if destroyingFailed then
+		error(destroyingMessage, 2)
+	end
+end
+
 local function fromInstance(instance: Instance, name: string?): GarbageMan
 	local scopeName = if name ~= nil then name else instance.Name
 	local garbageMan = GarbageManClass.new(scopeName)
@@ -1279,6 +1656,9 @@ function Debug.getSummary(): { ScopeDebugSummary }
 			destroyed = scopeInternal._destroyed,
 			cleaning = scopeInternal._sweeping,
 			destroyReason = if scopeInternal._destroyReason ~= nil then tostring(scopeInternal._destroyReason) else "",
+			cleanupCount = scopeInternal._cleanupCount,
+			lastCleanupDuration = scopeInternal._lastCleanupDuration,
+			peakCleanupDuration = scopeInternal._peakCleanupDuration,
 			lastCleanupError = lastCleanupError,
 			lastFailedObjectType = lastFailedObjectType,
 			lastFailedTag = lastFailedTag,
@@ -1320,6 +1700,7 @@ function module.configure(options: Config)
 	local tracebacks = options.tracebacks
 	local shouldCaptureAddTracebacks = options.captureAddTracebacks
 	local shouldWarnLeaks = options.leakWarnings
+	local shouldProfile = options.profiling
 	local handler = options.errorHandler
 
 	if tracebacks ~= nil then
@@ -1332,6 +1713,10 @@ function module.configure(options: Config)
 
 	if shouldWarnLeaks ~= nil then
 		leakWarningsEnabled = readConfigBoolean(shouldWarnLeaks, "leakWarnings")
+	end
+
+	if shouldProfile ~= nil then
+		profilingEnabled = readConfigBoolean(shouldProfile, "profiling")
 	end
 
 	if handler ~= nil then
@@ -1351,6 +1736,7 @@ function module.getConfig(): Config
 		tracebacks = tracebacksEnabled,
 		captureAddTracebacks = captureAddTracebacks,
 		leakWarnings = leakWarningsEnabled,
+		profiling = profilingEnabled,
 		errorHandler = errorHandler,
 	}
 
