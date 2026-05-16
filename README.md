@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Release: v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue.svg)](https://github.com/Virtualdesign0/GarbageMan/releases/tag/v0.1.0)
 
-A small typed cleanup manager for Roblox Luau.
+A typed lifecycle and cleanup manager for Roblox Luau.
 
 `GarbageMan` helps you keep temporary resources in one place and clean them up safely when a system is done. It is useful for connections, instances, promises, render step bindings, threads, functions, tweens, custom objects, UI controllers, tools, NPCs, hitboxes, projectiles and other runtime objects that should not live forever.
 
@@ -21,13 +21,18 @@ The idea is simple: create a scope, add the things that belong to that scope, th
 - Tag cleanup with `RemoveTag()`
 - Ownership release with `Drop()` and `DropTag()`
 - Child scopes with `Extend()` and `Adopt()`
-- Signal helpers with `Connect()` and `Once()`
+- Signal helpers with `Connect()`, `Once()`, `DestroyOnSignal()` and `ReplaceConnection()`
+- Tween helper with `ReplaceTween()`
+- Temporary resource cleanup with `AddTemporary()`
+- Delayed cleanup with `CleanAfter()` and `DestroyAfter()`
 - RenderStep cleanup with `Render()`
 - Promise cleanup with `AddPromise()`
 - Instance lifecycle binding with `BindTo()` and `BindToAncestry()`
 - Deferred cleanup with `CleanDeferred()` and `DestroyDeferred()`
+- Batched cleanup with `CleanBatched()` and `DestroyBatched()`
 - Lifecycle hooks with `OnDestroying()` and `OnDestroyed()`
 - Debug summaries, leak warnings, failed cleanup tracking and optional add tracebacks
+- Optional cleanup profiling through `GarbageMan.configure()`
 
 ---
 
@@ -218,13 +223,38 @@ scope:Destroy("Example finished")
 
 ---
 
+## Core Idea
+
+A `GarbageMan` scope owns the resources added to it.
+
+```lua
+local scope = GarbageMan.new("InventoryUI")
+
+scope:Add(connection)
+scope:Add(frame)
+scope:Add(function()
+	print("Inventory closed")
+end)
+
+scope:Clean()
+```
+
+`Clean()` removes and cleans everything currently tracked by the scope.
+
+`Destroy()` does the same cleanup but also permanently closes the scope.
+
+---
+
 ## Most Used Methods
 
 | Method | Use it for |
 |---|---|
-| `Add()` | Track a resource |
-| `AddPromise()` | Track a started promise |
+| `Add()` | Track one resource |
+| `AddMany()` | Track multiple default-cleanable resources |
+| `AddTemporary()` | Track one resource and clean it after a delay |
 | `Replace()` | Keep one resource for a tag |
+| `ReplaceConnection()` | Replace a tagged signal connection |
+| `ReplaceTween()` | Replace a tagged tween and cancel the old one |
 | `Get()` | Get a tagged resource |
 | `Remove()` | Remove and clean a resource |
 | `RemoveTag()` | Remove and clean a tagged resource |
@@ -234,6 +264,11 @@ scope:Destroy("Example finished")
 | `Extend()` | Create a child scope |
 | `Connect()` | Connect and track a signal |
 | `Once()` | Connect once and track the connection |
+| `DestroyOnSignal()` | Destroy the scope when a signal fires |
+| `CleanBatched()` | Clean resources in batches |
+| `DestroyBatched()` | Destroy the scope and clean resources in batches |
+| `CleanAfter()` | Clean the scope after a delay |
+| `DestroyAfter()` | Destroy the scope after a delay |
 
 ---
 
@@ -292,31 +327,9 @@ You can clean these manually but it gets messy once the system grows.
 
 GarbageMan follows the same cleanup-scope idea as Maid and Trove-style utilities.
 
-The main difference is that GarbageMan also includes tagged resources, final destroy semantics, child scopes, lifecycle hooks, leak warnings, failed cleanup tracking and debug summaries for larger systems.
+The main difference is that GarbageMan also includes tagged resources, final destroy semantics, child scopes, lifecycle hooks, temporary resource helpers, batched cleanup, leak warnings, failed cleanup tracking and debug summaries for larger systems.
 
 It is still meant to stay small enough to use in normal gameplay code.
-
----
-
-## Core Idea
-
-A `GarbageMan` scope owns the resources added to it.
-
-```lua
-local scope = GarbageMan.new("InventoryUI")
-
-scope:Add(connection)
-scope:Add(frame)
-scope:Add(function()
-	print("Inventory closed")
-end)
-
-scope:Clean()
-```
-
-`Clean()` removes and cleans everything currently tracked by the scope.
-
-`Destroy()` does the same cleanup but also permanently closes the scope.
 
 ---
 
@@ -414,6 +427,123 @@ Supported resources include:
 
 ---
 
+## AddMany
+
+`AddMany()` adds multiple resources using the default cleanup resolver.
+
+```lua
+scope:AddMany(connection, frame, cleanupFunction)
+```
+
+It returns the same scope:
+
+```lua
+scope:AddMany(connection, frame):Clean()
+```
+
+`AddMany()` is only for resources that can be cleaned using the default cleanup resolver.
+
+For resources that need a custom cleanup method, use `Add()`:
+
+```lua
+scope:Add(tween, "Cancel")
+```
+
+For tweens, you can also use `ReplaceTween()`:
+
+```lua
+scope:ReplaceTween("Tween:Open", tween)
+```
+
+---
+
+## Temporary Resources
+
+GarbageMan has three different delayed lifetime helpers:
+
+| Method | What it does |
+|---|---|
+| `AddTemporary()` | Cleans one resource after a delay |
+| `CleanAfter()` | Cleans the scope after a delay but keeps it reusable |
+| `DestroyAfter()` | Destroys the scope after a delay |
+
+### AddTemporary
+
+`AddTemporary()` tracks one resource and removes it after a delay.
+
+```lua
+local effect = Instance.new("Part")
+effect.Parent = workspace
+
+scope:AddTemporary(effect, 3)
+```
+
+After 3 seconds, only `effect` is removed and cleaned. The scope itself stays alive.
+
+You can also pass a cleanup method:
+
+```lua
+scope:AddTemporary(tween, 2, "Cancel")
+```
+
+You can use tags too:
+
+```lua
+scope:AddTemporary(effect, 5, nil, "Effect:Spark")
+```
+
+This is useful for:
+
+- temporary hitboxes
+- VFX parts
+- temporary sounds
+- trails
+- short UI effects
+- dropped items
+- short-lived projectiles
+
+### CleanAfter
+
+`CleanAfter()` schedules a reusable cleanup.
+
+```lua
+local cancelClean = scope:CleanAfter(5)
+```
+
+After 5 seconds, the scope calls `Clean()`. The scope is not destroyed and can still be used later.
+
+You can cancel the scheduled clean:
+
+```lua
+local cancelClean = scope:CleanAfter(5)
+
+cancelClean()
+```
+
+Use this when the scope should stay alive but its current resources should expire.
+
+### DestroyAfter
+
+`DestroyAfter()` schedules final destruction.
+
+```lua
+local cancelDestroy = scope:DestroyAfter(10, "Expired")
+```
+
+After 10 seconds, the scope calls `Destroy("Expired")`.
+
+You can cancel the scheduled destroy:
+
+```lua
+local cancelDestroy = scope:DestroyAfter(10, "Expired")
+
+cancelDestroy()
+```
+
+Use this for temporary scopes such as projectiles, temporary hitbox scopes, VFX scopes, UI notifications or dropped item scopes.
+
+---
+
 ## Custom Cleanup Methods
 
 Sometimes a resource should not be destroyed. For example, tweens are usually cancelled.
@@ -486,6 +616,106 @@ For normal usage, prefer `Replace()` when you want to work with tags.
 
 ---
 
+## Signal Helpers
+
+### Connect
+
+`Connect()` connects to a signal and tracks the connection.
+
+```lua
+scope:Connect(part.Touched, function(hit)
+	print(hit.Name)
+end)
+```
+
+This is the same idea as:
+
+```lua
+local connection = part.Touched:Connect(function(hit)
+	print(hit.Name)
+end)
+
+scope:Add(connection)
+```
+
+### Once
+
+`Once()` connects to a signal once and then cleans the connection.
+
+```lua
+scope:Once(part.Destroying, function()
+	print("Part destroyed")
+end)
+```
+
+If the signal supports `Once`, GarbageMan uses it. Otherwise, it falls back to a normal connection and disconnects after the first call.
+
+### DestroyOnSignal
+
+`DestroyOnSignal()` destroys the scope when a signal fires.
+
+```lua
+scope:DestroyOnSignal(humanoid.Died, "Humanoid died")
+```
+
+Good examples:
+
+```lua
+scope:DestroyOnSignal(tool.Unequipped, "Tool unequipped")
+scope:DestroyOnSignal(model.Destroying, "Model destroyed")
+scope:DestroyOnSignal(closeButton.Activated, "UI closed")
+```
+
+This helper uses `Once()` internally, so the signal only destroys the scope once.
+
+### ReplaceConnection
+
+`ReplaceConnection()` keeps one active connection for a tag.
+
+```lua
+scope:ReplaceConnection("Input", UserInputService.InputBegan, function(input)
+	print(input)
+end)
+```
+
+If the same tag is used again, the old connection is cleaned first.
+
+```lua
+scope:ReplaceConnection("Input", UserInputService.InputEnded, function(input)
+	print(input)
+end)
+```
+
+This is useful for UI, input, tool and character state changes.
+
+---
+
+## Tween Helper
+
+`ReplaceTween()` keeps one active tween for a tag and cancels the old one when replaced.
+
+```lua
+local tween = TweenService:Create(frame, tweenInfo, {
+	Position = UDim2.fromScale(0.5, 0.5),
+})
+
+scope:ReplaceTween("Tween:Open", tween)
+tween:Play()
+```
+
+Replacing the same tag cancels the previous tween:
+
+```lua
+local closeTween = TweenService:Create(frame, tweenInfo, {
+	Position = UDim2.fromScale(0.5, 1.2),
+})
+
+scope:ReplaceTween("Tween:Open", closeTween)
+closeTween:Play()
+```
+
+---
+
 ## Remove vs Drop
 
 ### Remove
@@ -532,50 +762,14 @@ otherScope:Add(object)
 If your tags follow a pattern, you can remove a group of them.
 
 ```lua
-scope:Replace("Tween:Open", openTween, "Cancel")
-scope:Replace("Tween:Close", closeTween, "Cancel")
-scope:Replace("Tween:Hover", hoverTween, "Cancel")
+scope:ReplaceTween("Tween:Open", openTween)
+scope:ReplaceTween("Tween:Close", closeTween)
+scope:ReplaceTween("Tween:Hover", hoverTween)
 
 scope:RemoveTagsWithPrefix("Tween:")
 ```
 
 `RemoveTagsWithPrefix()` scans the current tag set. It is useful for grouped cleanup but it should not be used every frame.
-
----
-
-## Signals
-
-### Connect
-
-`Connect()` connects to a signal and tracks the connection.
-
-```lua
-scope:Connect(part.Touched, function(hit)
-	print(hit.Name)
-end)
-```
-
-This is the same idea as:
-
-```lua
-local connection = part.Touched:Connect(function(hit)
-	print(hit.Name)
-end)
-
-scope:Add(connection)
-```
-
-### Once
-
-`Once()` connects to a signal once and then cleans the connection.
-
-```lua
-scope:Once(part.Destroying, function()
-	print("Part destroyed")
-end)
-```
-
-If the signal supports `Once`, GarbageMan uses it. Otherwise, it falls back to a normal connection and disconnects after the first call.
 
 ---
 
@@ -789,6 +983,7 @@ Lifecycle hooks only run for:
 ```lua
 scope:Destroy()
 scope:DestroyDeferred()
+scope:DestroyBatched()
 ```
 
 They do not run for reusable cleanup:
@@ -813,7 +1008,7 @@ If a lifecycle hook errors, GarbageMan still tries to continue the destroy flow 
 
 ## Destroy Reasons
 
-`Destroy()` and `DestroyDeferred()` accept an optional reason.
+`Destroy()`, `DestroyDeferred()`, `DestroyBatched()` and `DestroyAfter()` accept an optional reason.
 
 ```lua
 scope:Destroy("Player left")
@@ -839,7 +1034,7 @@ This is mostly useful for debugging larger systems.
 
 ---
 
-## Deferred Cleanup
+## Deferred and Batched Cleanup
 
 ### CleanDeferred
 
@@ -875,6 +1070,35 @@ Behavior:
 - `OnDestroyed` runs after the deferred cleanup attempt.
 
 If deferred destroy cleanup fails, GarbageMan reports the error through the configured error handler if one exists.
+
+### CleanBatched
+
+`CleanBatched()` splits cleanup across multiple scheduler steps.
+
+```lua
+scope:CleanBatched(50)
+```
+
+The number controls how many resources are cleaned per batch.
+
+Use this when a scope owns many resources and cleaning all of them at once could create a spike.
+
+### DestroyBatched
+
+`DestroyBatched()` marks the scope as destroyed immediately, then cleans its resources in batches.
+
+```lua
+scope:DestroyBatched("Round ended", 50)
+```
+
+Behavior:
+
+- The scope is marked as destroyed immediately.
+- Mutating methods such as `Add()` and `Replace()` cannot be used afterwards.
+- Cleanup work is processed in batches.
+- `OnDestroyed` runs after the batched cleanup attempt.
+
+Batched cleanup uses scheduler steps. It should not be described as guaranteed per-frame cleanup.
 
 ---
 
@@ -1035,6 +1259,9 @@ A summary contains:
 	destroyed = false,
 	cleaning = false,
 	destroyReason = "",
+	cleanupCount = 1,
+	lastCleanupDuration = 0,
+	peakCleanupDuration = 0,
 	lastCleanupError = "",
 	lastFailedObjectType = "",
 	lastFailedTag = "",
@@ -1062,6 +1289,7 @@ GarbageMan.configure({
 	tracebacks = true,
 	captureAddTracebacks = true,
 	leakWarnings = true,
+	profiling = true,
 	errorHandler = function(message, scope)
 		warn("GarbageMan error in", scope:GetName(), message)
 	end,
@@ -1075,7 +1303,8 @@ Available options:
 | `tracebacks` | Adds tracebacks to cleanup errors |
 | `captureAddTracebacks` | Stores where each resource was added |
 | `leakWarnings` | Enables or disables leak warning output |
-| `errorHandler` | Handles async cleanup errors from deferred destroy |
+| `profiling` | Tracks cleanup count, last cleanup duration and peak cleanup duration |
+| `errorHandler` | Handles async cleanup errors from delayed, deferred or batched cleanup |
 
 To remove the error handler:
 
@@ -1093,9 +1322,12 @@ local config = GarbageMan.getConfig()
 print(config.tracebacks)
 print(config.captureAddTracebacks)
 print(config.leakWarnings)
+print(config.profiling)
 ```
 
 Traceback capture is disabled by default because it has extra cost. It is best used during development.
+
+Profiling is also disabled by default. When enabled, debug summaries include cleanup duration information.
 
 ---
 
@@ -1105,18 +1337,26 @@ A few important details:
 
 - `Clean()` cleans current resources and keeps the scope reusable.
 - `Destroy()` is final and prevents future mutation.
+- `AddTemporary()` cleans one resource after a delay.
+- `CleanAfter()` calls `Clean()` after a delay.
+- `DestroyAfter()` calls `Destroy()` after a delay.
 - `Remove()` cleans an object and removes it from the scope.
 - `Drop()` removes an object without cleaning it.
 - `Replace()` cleans the old tagged resource before storing the new one.
+- `ReplaceTween()` uses `"Cancel"` as the cleanup method.
+- `ReplaceConnection()` stores a connection under a tag.
 - `RemoveTag()` cleans a tagged resource.
 - `DropTag()` removes a tag without cleaning its object.
 - `RemoveTagsWithPrefix()` scans the current tag set.
 - Cleanup runs in reverse insertion order.
 - `DestroyDeferred()` marks the scope as destroyed immediately.
+- `DestroyBatched()` marks the scope as destroyed immediately.
 - `AddPromise()` only tracks started promises.
 - Debug tracebacks are optional and disabled by default.
 - `GetDebugDump()` returns real object references.
 - `GetDebugSummary()` is safer for logs.
+- Batched and delayed cleanup methods run asynchronously.
+- Async cleanup errors are reported through the configured error handler when one is set.
 
 ---
 
@@ -1150,6 +1390,7 @@ Avoid using expensive debug features in hot paths:
 - Do not call `RemoveTagsWithPrefix()` every frame.
 - Do not spam `GetDebugDump()` in production logs.
 - Keep `captureAddTracebacks` disabled unless you are debugging leaks.
+- Keep `profiling` disabled unless you are measuring cleanup cost.
 - Prefer `GetDebugSummary()` over `GetDebugDump()` for debug panels.
 
 ---
@@ -1247,6 +1488,26 @@ Turn it off when you no longer need it:
 ```lua
 GarbageMan.configure({
 	captureAddTracebacks = false,
+})
+```
+
+### Do not keep `profiling` enabled unless you are measuring cleanup
+
+Profiling is useful when finding cleanup spikes but it should usually stay off in normal gameplay code.
+
+Use it while testing:
+
+```lua
+GarbageMan.configure({
+	profiling = true,
+})
+```
+
+Turn it off afterwards:
+
+```lua
+GarbageMan.configure({
+	profiling = false,
 })
 ```
 
@@ -1408,7 +1669,7 @@ local state = {
 	currentQuest = "FindFruit",
 }
 
-scope:Replace("Tween:Current", tween, "Cancel")
+scope:ReplaceTween("Tween:Current", tween)
 ```
 
 ### Do not assume `BindToAncestry()` means the instance was destroyed
@@ -1461,7 +1722,10 @@ scope:IsDestroyed() -> boolean
 ### Adding Resources
 
 ```lua
-scope:Add(object, cleanupMethod?) -> object
+scope:Add(object, cleanupMethod?, tag?) -> object
+scope:AddMany(...objects) -> GarbageMan
+scope:AddTemporary(object, seconds, cleanupMethod?, tag?) -> object
+
 scope:AddPromise(promise) -> promise
 scope:Construct(classOrFunction, ...) -> object
 scope:Copy(instance) -> Instance
@@ -1473,6 +1737,9 @@ scope:Copy(instance) -> Instance
 
 ```lua
 scope:Replace(tag, object, cleanupMethod?) -> object
+scope:ReplaceConnection(tag, signal, callback) -> connection
+scope:ReplaceTween(tag, tween) -> tween
+
 scope:Get(tag) -> any?
 
 scope:Contains(object) -> boolean
@@ -1495,6 +1762,8 @@ scope:DropTag(tag) -> boolean
 ```lua
 scope:Connect(signal, callback) -> connection
 scope:Once(signal, callback) -> connection
+scope:DestroyOnSignal(signal, reason?) -> connection
+
 scope:Render(name, priority, callback)
 ```
 
@@ -1518,11 +1787,15 @@ scope:BindToAncestry(instance) -> RBXScriptConnection
 scope:Clean()
 scope:TryClean() -> (boolean, any)
 scope:CleanDeferred()
+scope:CleanBatched(batchSize?)
+scope:CleanAfter(seconds) -> cancel
 scope:WrapClean() -> () -> ()
 
 scope:Destroy(reason?)
 scope:TryDestroy(reason?) -> (boolean, any)
 scope:DestroyDeferred(reason?)
+scope:DestroyBatched(reason?, batchSize?)
+scope:DestroyAfter(seconds, reason?) -> cancel
 ```
 
 ### Lifecycle Hooks
@@ -1544,7 +1817,7 @@ scope:GetLastFailedEntry() -> DebugEntry?
 scope:GetTags() -> { any }
 scope:AssertEmpty()
 
-scope:WarnIfNotDestroyedAfter(seconds, message?) -> disconnect
+scope:WarnIfNotDestroyedAfter(seconds, message?) -> cancel
 ```
 
 ---
@@ -1581,25 +1854,29 @@ tests/
 
 ## Tests
 
-This repository includes two spec files:
-
-```text
-GarbageMan.spec
-Promise.spec
-```
+This repository includes spec files for the main scope behavior and promise behavior.
 
 `GarbageMan.spec` covers the main scope behavior, including:
 
 - `Add()` and `Clean()`
+- `AddMany()`
+- `AddTemporary()`
+- `CleanAfter()`
+- `DestroyAfter()`
 - `Destroy()` final behavior
 - `Replace()` tag replacement
+- `ReplaceConnection()`
+- `ReplaceTween()`
 - `Remove()` and `RemoveTag()`
 - `Drop()` and `DropTag()`
 - `Extend()` and `Adopt()`
 - `Connect()` and `Once()`
+- `DestroyOnSignal()`
 - `BindTo()` and `BindToAncestry()`
 - `CleanDeferred()` queue merging
+- `CleanBatched()` behavior
 - `DestroyDeferred()` behavior
+- `DestroyBatched()` behavior
 - lifecycle hooks
 - debug summary
 - failed cleanup tracking
@@ -1623,18 +1900,53 @@ local scope = GarbageMan.new("InventoryUI")
 local frame = scope:Copy(InventoryTemplate)
 frame.Parent = playerGui
 
-scope:Connect(closeButton.Activated, function()
-	scope:Destroy("Inventory closed")
-end)
+scope:DestroyOnSignal(closeButton.Activated, "Inventory closed")
 
-scope:Replace("Tween:Open", TweenService:Create(frame, tweenInfo, {
+local openTween = TweenService:Create(frame, tweenInfo, {
 	Position = UDim2.fromScale(0.5, 0.5),
-}), "Cancel")
+})
 
-local tween = scope:Get("Tween:Open")
-if tween then
-	tween:Play()
-end
+scope:ReplaceTween("Tween:Open", openTween)
+openTween:Play()
+```
+
+---
+
+## Example: Temporary Hitbox
+
+```lua
+local scope = GarbageMan.new("Hitbox")
+
+local hitbox = Instance.new("Part")
+hitbox.Name = "TemporaryHitbox"
+hitbox.Anchored = true
+hitbox.CanCollide = false
+hitbox.Parent = workspace
+
+scope:AddTemporary(hitbox, 0.25)
+
+scope:Connect(hitbox.Touched, function(hit)
+	print("Touched:", hit.Name)
+end)
+```
+
+---
+
+## Example: Projectile Scope
+
+```lua
+local projectileScope = GarbageMan.new("Projectile")
+
+projectileScope:DestroyAfter(10, "Projectile expired")
+
+local projectile = projectileScope:Construct(Instance, "Part")
+projectile.Name = "Projectile"
+projectile.Parent = workspace
+
+projectileScope:Connect(projectile.Touched, function(hit)
+	print("Projectile hit:", hit.Name)
+	projectileScope:Destroy("Projectile hit something")
+end)
 ```
 
 ---
@@ -1648,9 +1960,7 @@ npcScope:WarnIfNotDestroyedAfter(120)
 
 npcScope:BindTo(npcModel)
 
-npcScope:Connect(npcModel.Destroying, function()
-	print("NPC model destroyed")
-end)
+npcScope:DestroyOnSignal(npcModel.Destroying, "NPC model destroyed")
 
 npcScope:OnDestroyed(function(reason)
 	print("NPC scope destroyed:", reason)
@@ -1663,6 +1973,22 @@ end)
 
 ---
 
+## Example: Batched Round Cleanup
+
+```lua
+local roundScope = GarbageMan.new("Round")
+
+for _, npc in npcs do
+	roundScope:Add(npc)
+end
+
+roundScope:DestroyBatched("Round ended", 50)
+```
+
+This splits cleanup across multiple scheduler steps instead of cleaning everything in one immediate sweep.
+
+---
+
 ## Example: Debug Panel
 
 ```lua
@@ -1671,6 +1997,9 @@ for _, summary in GarbageMan.Debug.getSummary() do
 		summary.name,
 		summary.size,
 		math.floor(summary.age),
+		summary.cleanupCount,
+		summary.lastCleanupDuration,
+		summary.peakCleanupDuration,
 		summary.lastCleanupError
 	)
 end
