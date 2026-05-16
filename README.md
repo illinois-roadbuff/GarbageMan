@@ -1,7 +1,7 @@
 # GarbageMan
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Release: v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue.svg)](https://github.com/Virtualdesign0/GarbageMan/releases/tag/v0.1.0)
+[![Release: v0.1.1](https://img.shields.io/badge/release-v0.1.1-blue.svg)](https://github.com/Virtualdesign0/GarbageMan/releases/tag/v0.1.1)
 
 A typed lifecycle and cleanup manager for Roblox Luau.
 
