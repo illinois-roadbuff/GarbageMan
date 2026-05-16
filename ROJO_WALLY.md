@@ -53,7 +53,7 @@ Package configuration used in this repository:
 ```toml
 [package]
 name = "virtualdesign0/garbageman"
-version = "0.1.0"
+version = "0.1.2"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 ```
@@ -64,7 +64,7 @@ To use this package as a dependency in another project:
 
 ```toml
 [dependencies]
-GarbageMan = "virtualdesign0/garbageman@0.1.0"
+GarbageMan = "virtualdesign0/garbageman@0.1.2"
 ```
 
 Then run:
