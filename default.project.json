@@ -1,0 +1,12 @@
+{
+  "name": "GarbageMan",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "GarbageMan": {
+        "$path": "src/GarbageMan"
+      }
+    }
+  }
+}
